@@ -1,0 +1,10 @@
+node_modules
+reports
+logs
+.git
+.gitignore
+*.md
+start.sh
+docker_run.sh
+docker_build.sh
+.env
