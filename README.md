@@ -7,7 +7,9 @@ Classifies sensor deployment types (INDOOR, OUTDOOR, DEVICE, NON_AIR, MOBILE, PO
 
 ## Overview
 
-Meshtastic and Home Assistant sensors arrive without deployment metadata — we don't know if they're indoors, outdoors, measuring device temperature, or attached to a pipe. This service analyses historical data and local weather patterns to classify each sensor automatically.
+Meshtastic sensors arrive without deployment metadata — we don't know if they're indoors, outdoors, measuring device temperature, or attached to a pipe. This service analyses historical data and local weather patterns to classify each sensor automatically.
+
+Currently Meshtastic-specific (WeSense sensors have properly calibrated sensors and known deployment types; Home Assistant sensors may be added later). Uses the Open-Meteo API for historical weather correlation — this external dependency may be replaced once the WeSense network has enough outdoor reference sensors.
 
 **Classification strategies (weighted voting):**
 - **Variance analysis** (35%) — indoor sensors have stable temperatures with low variance
@@ -94,6 +96,35 @@ npm start -- --json
 ## Output
 
 Reports are saved to `reports/classification-YYYY-MM-DDTHH-MM-SS.json` containing summary counts, suspicious sensors with reasons, and full classification data.
+
+## IPFS Archival Dependency
+
+The classifier must run **before** data is exported to the ClickHouse IPFS permanent archive. Once readings are archived to IPFS with a `deployment_type`, that classification is immutable (content-addressed). The archival pipeline should ensure the classifier has processed all sensors for the archive window before exporting.
+
+Sequence: `Ingest → Classify → Archive to IPFS`
+
+This is not yet implemented — ClickHouse IPFS archival is a future phase. See `wesense-general-docs/general/Ingester_Consolidation_Plan.md` for the full roadmap.
+
+## Docker Compose
+
+The classifier is not currently included in `wesense-deploy` profiles. It runs independently against the ClickHouse database on a schedule. To add it to a station deployment:
+
+```yaml
+# Add to wesense-deploy/docker-compose.yml
+deployment-classifier:
+  image: ghcr.io/wesense-earth/wesense-deployment-classifier:latest
+  environment:
+    - CLICKHOUSE_HOST=http://clickhouse:8123
+    - CLICKHOUSE_USER=default
+    - CLICKHOUSE_DATABASE=wesense
+    - CLASSIFIER_SCHEDULE=0 */12 * * *
+    - RUN_ON_STARTUP=true
+  volumes:
+    - ./classifier/reports:/app/reports
+  depends_on:
+    clickhouse:
+      condition: service_healthy
+```
 
 ## Related
 
