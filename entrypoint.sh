@@ -11,8 +11,8 @@ MAX_LOG_SIZE_KB="${LOG_MAX_SIZE_KB:-10240}"  # Default 10MB
 MAX_LOG_FILES="${LOG_MAX_FILES:-5}"          # Keep 5 rotated files
 
 # Ensure writable directories exist with correct ownership
-mkdir -p "$LOG_DIR" /app/reports
-chown -R "$PUID:$PGID" "$LOG_DIR" /app/reports
+mkdir -p "$LOG_DIR" /app/reports /app/data
+chown -R "$PUID:$PGID" "$LOG_DIR" /app/reports /app/data
 
 # Function to rotate logs
 rotate_logs() {
