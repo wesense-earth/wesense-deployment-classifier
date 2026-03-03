@@ -1,13 +1,18 @@
 #!/bin/sh
-# Entrypoint script with rolling log support
+# Entrypoint script — fix ownership, drop privileges, rolling log support
+set -e
+
+PUID="${PUID:-1000}"
+PGID="${PGID:-1000}"
 
 LOG_DIR="/app/logs"
 LOG_FILE="$LOG_DIR/classifier.log"
 MAX_LOG_SIZE_KB="${LOG_MAX_SIZE_KB:-10240}"  # Default 10MB
 MAX_LOG_FILES="${LOG_MAX_FILES:-5}"          # Keep 5 rotated files
 
-# Create log directory if it doesn't exist
-mkdir -p "$LOG_DIR"
+# Ensure writable directories exist with correct ownership
+mkdir -p "$LOG_DIR" /app/reports
+chown -R "$PUID:$PGID" "$LOG_DIR" /app/reports
 
 # Function to rotate logs
 rotate_logs() {
@@ -57,5 +62,6 @@ while true; do
     rotate_logs
 done &
 
-# Run the classifier with output to both console and log file
-exec node src/index.js 2>&1 | tee -a "$LOG_FILE"
+# Drop privileges and run the classifier with output to both console and log file
+exec setpriv --reuid="$PUID" --regid="$PGID" --clear-groups \
+    sh -c 'node src/index.js 2>&1 | tee -a "'"$LOG_FILE"'"'
