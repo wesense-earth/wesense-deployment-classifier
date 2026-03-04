@@ -634,6 +634,7 @@ async function runClassifier(days = 7, shouldApply = false, overwrite = false, u
     if (useSmartScheduling) {
         sensorsToEvaluate = [];
         const skipReasons = {};
+        const evalReasons = {};
 
         for (const sensor of sensors) {
             const rowCount = parseInt(sensor.reading_count) || 0;
@@ -641,6 +642,7 @@ async function runClassifier(days = 7, shouldApply = false, overwrite = false, u
 
             if (evaluate) {
                 sensorsToEvaluate.push(sensor);
+                evalReasons[reason] = (evalReasons[reason] || 0) + 1;
             } else {
                 skippedSensors.push(sensor);
                 // Aggregate skip reasons for summary
@@ -649,13 +651,20 @@ async function runClassifier(days = 7, shouldApply = false, overwrite = false, u
             }
         }
 
-        if (skippedSensors.length > 0) {
-            console.log(`Smart scheduling: evaluating ${sensorsToEvaluate.length}, skipping ${skippedSensors.length} sensors (backoff)`);
-            for (const [reason, count] of Object.entries(skipReasons).sort((a, b) => b[1] - a[1])) {
-                console.log(`  ${reason}: ${count}`);
+        console.log(`Smart scheduling: evaluating ${sensorsToEvaluate.length} of ${sensors.length} sensors`);
+        if (sensorsToEvaluate.length > 0) {
+            console.log('  Evaluating:');
+            for (const [reason, count] of Object.entries(evalReasons).sort((a, b) => b[1] - a[1])) {
+                console.log(`    ${reason}: ${count}`);
             }
-            console.log('');
         }
+        if (skippedSensors.length > 0) {
+            console.log(`  Skipping ${skippedSensors.length} (backoff):`);
+            for (const [reason, count] of Object.entries(skipReasons).sort((a, b) => b[1] - a[1])) {
+                console.log(`    ${reason}: ${count}`);
+            }
+        }
+        console.log('');
     }
 
     if (sensorsToEvaluate.length === 0) {
@@ -705,7 +714,25 @@ async function runClassifier(days = 7, shouldApply = false, overwrite = false, u
         if (pruned > 0) console.log(`Pruned ${pruned} removed devices from state`);
 
         state.save();
-        console.log(`Classification state saved (${Object.keys(state.state.devices).length} devices tracked)`);
+
+        // Log summary of what next run will look like
+        const postStats = state.getStats();
+        console.log('\nSmart scheduling summary:');
+        console.log(`  Devices tracked: ${postStats.total_tracked}`);
+        console.log(`  Will evaluate next run: ${postStats.eligible_now} (new/expired backoff)`);
+        console.log(`  Will skip next run: ${postStats.backing_off} (in backoff)`);
+        if (Object.keys(postStats.by_last_result).length > 0) {
+            console.log('  By last result:');
+            for (const [result, count] of Object.entries(postStats.by_last_result).sort((a, b) => b[1] - a[1])) {
+                console.log(`    ${result}: ${count}`);
+            }
+        }
+        if (Object.keys(postStats.by_skip_reason).length > 0) {
+            console.log('  Backing off:');
+            for (const [reason, count] of Object.entries(postStats.by_skip_reason).sort((a, b) => b[1] - a[1])) {
+                console.log(`    ${reason}: ${count}`);
+            }
+        }
     }
 
     return results;

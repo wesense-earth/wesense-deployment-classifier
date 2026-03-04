@@ -29,17 +29,35 @@ export class ClassificationState {
      */
     load() {
         try {
+            // Check data directory exists and is writable
+            const dir = path.dirname(this.statePath);
+            if (!fs.existsSync(dir)) {
+                fs.mkdirSync(dir, { recursive: true });
+                console.log(`Created state directory: ${dir}`);
+            }
+            // Verify writable by touching a test file
+            const testFile = path.join(dir, '.write-test');
+            try {
+                fs.writeFileSync(testFile, '');
+                fs.unlinkSync(testFile);
+                console.log(`State directory writable: ${dir}`);
+            } catch (writeErr) {
+                console.error(`WARNING: State directory ${dir} is NOT writable (${writeErr.message}) — state will not persist`);
+            }
+
             if (fs.existsSync(this.statePath)) {
                 const raw = fs.readFileSync(this.statePath, 'utf-8');
                 const parsed = JSON.parse(raw);
                 if (parsed.version === STATE_VERSION && parsed.devices) {
                     this.state = parsed;
+                    const deviceCount = Object.keys(parsed.devices).length;
+                    console.log(`Loaded classification state: ${deviceCount} devices from ${this.statePath}`);
                 } else {
                     console.log(`Classification state version mismatch (got ${parsed.version}, expected ${STATE_VERSION}), starting fresh`);
                     this.state = { version: STATE_VERSION, devices: {} };
                 }
             } else {
-                console.log('No classification state file found, starting fresh');
+                console.log(`No classification state file found at ${this.statePath}, starting fresh (first run)`);
             }
         } catch (error) {
             console.error(`Failed to load classification state: ${error.message}, starting fresh`);
@@ -57,8 +75,12 @@ export class ClassificationState {
         }
 
         const tmpPath = this.statePath + '.tmp';
-        fs.writeFileSync(tmpPath, JSON.stringify(this.state, null, 2));
+        const json = JSON.stringify(this.state, null, 2);
+        fs.writeFileSync(tmpPath, json);
         fs.renameSync(tmpPath, this.statePath);
+
+        const sizeKB = (Buffer.byteLength(json) / 1024).toFixed(1);
+        console.log(`State saved to ${this.statePath} (${sizeKB}KB)`);
     }
 
     /**
