@@ -5,6 +5,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { getSensors, client } from './clickhouse-client.js';
 import { classifySensor, classifyAllSensors, THRESHOLDS } from './classifier.js';
+import { ClassificationState } from './classification-state.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPORTS_DIR = path.join(__dirname, '..', 'reports');
@@ -596,10 +597,24 @@ async function applyClassifications(results, overwrite = false) {
 
 /**
  * Run the classifier (used by both manual and scheduled modes)
+ * @param {number} days - Days of weather data to use
+ * @param {boolean} shouldApply - Whether to apply classifications to database
+ * @param {boolean} overwrite - Whether to overwrite existing classifications
+ * @param {boolean} useSmartScheduling - Whether to use state-based filtering (default true in scheduler mode)
  */
-async function runClassifier(days = 7, shouldApply = false, overwrite = false) {
+async function runClassifier(days = 7, shouldApply = false, overwrite = false, useSmartScheduling = SCHEDULER_MODE) {
     console.log('Sensor Deployment Classifier');
     console.log(`Using 90 days history for variance/mobility, ${days} days for weather correlation\n`);
+
+    // Load classification state for smart scheduling
+    const state = new ClassificationState();
+    if (useSmartScheduling) {
+        state.load();
+        const stateStats = state.getStats();
+        if (stateStats.total_tracked > 0) {
+            console.log(`Classification state: ${stateStats.total_tracked} tracked devices (${stateStats.eligible_now} eligible, ${stateStats.backing_off} backing off)`);
+        }
+    }
 
     // Get sensors (filtered to Meshtastic/HomeAssistant sensors with enough data for classification)
     // WeSense sensors are excluded - they have calibrated sensors and don't need classification
@@ -612,8 +627,51 @@ async function runClassifier(days = 7, shouldApply = false, overwrite = false) {
         return null;
     }
 
-    // Classify all sensors
-    const results = await classifyAllSensors(sensors, days);
+    // Smart scheduling: filter sensors through state
+    let sensorsToEvaluate = sensors;
+    const skippedSensors = [];
+
+    if (useSmartScheduling) {
+        sensorsToEvaluate = [];
+        const skipReasons = {};
+
+        for (const sensor of sensors) {
+            const rowCount = parseInt(sensor.reading_count) || 0;
+            const { evaluate, reason } = state.shouldEvaluate(sensor.device_id, rowCount);
+
+            if (evaluate) {
+                sensorsToEvaluate.push(sensor);
+            } else {
+                skippedSensors.push(sensor);
+                // Aggregate skip reasons for summary
+                const key = reason.split(',')[0]; // e.g. "insufficient_data"
+                skipReasons[key] = (skipReasons[key] || 0) + 1;
+            }
+        }
+
+        if (skippedSensors.length > 0) {
+            console.log(`Smart scheduling: evaluating ${sensorsToEvaluate.length}, skipping ${skippedSensors.length} sensors (backoff)`);
+            for (const [reason, count] of Object.entries(skipReasons).sort((a, b) => b[1] - a[1])) {
+                console.log(`  ${reason}: ${count}`);
+            }
+            console.log('');
+        }
+    }
+
+    if (sensorsToEvaluate.length === 0) {
+        console.log('No sensors eligible for evaluation this run (all in backoff).');
+        if (useSmartScheduling) {
+            // Prune removed devices
+            const activeIds = new Set(sensors.map(s => s.device_id));
+            const pruned = state.prune(activeIds);
+            if (pruned > 0) console.log(`Pruned ${pruned} removed devices from state`);
+            state.save();
+        }
+        return null;
+    }
+
+    // Classify eligible sensors
+    const results = await classifyAllSensors(sensorsToEvaluate, days);
 
     // Print report
     printReport(results);
@@ -624,6 +682,30 @@ async function runClassifier(days = 7, shouldApply = false, overwrite = false) {
     // Apply to database if requested
     if (shouldApply) {
         await applyClassifications(results, overwrite);
+    }
+
+    // Record results in state and save
+    if (useSmartScheduling) {
+        for (const result of results) {
+            const sensor = sensorsToEvaluate.find(s => s.device_id === result.device_id);
+            const rowCount = sensor ? parseInt(sensor.reading_count) || 0 : 0;
+
+            if (result.weather_api_failed) {
+                state.recordResult(result.device_id, 'weather_api_failed', rowCount);
+            } else if (result.inferred_deployment_type === 'UNKNOWN' && result.deployment_confidence === 0) {
+                state.recordResult(result.device_id, 'insufficient_data', rowCount);
+            } else {
+                state.recordResult(result.device_id, 'classified', rowCount, result.inferred_deployment_type);
+            }
+        }
+
+        // Prune devices no longer in ClickHouse
+        const activeIds = new Set(sensors.map(s => s.device_id));
+        const pruned = state.prune(activeIds);
+        if (pruned > 0) console.log(`Pruned ${pruned} removed devices from state`);
+
+        state.save();
+        console.log(`Classification state saved (${Object.keys(state.state.devices).length} devices tracked)`);
     }
 
     return results;

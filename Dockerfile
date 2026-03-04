@@ -16,7 +16,7 @@ COPY entrypoint.sh ./
 RUN chmod +x entrypoint.sh
 
 # Create directories for reports and logs
-RUN mkdir -p /app/reports /app/logs
+RUN mkdir -p /app/reports /app/logs /app/data
 
 # Environment variables (can be overridden via docker run -e)
 # Note: Configure these via docker run -e or use docker_run.sh with .env file
