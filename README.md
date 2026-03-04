@@ -133,4 +133,4 @@ deployment-classifier:
 
 ## License
 
-MIT
+AGPL-3.0
