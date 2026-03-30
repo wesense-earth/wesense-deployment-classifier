@@ -8,6 +8,9 @@ COPY package*.json ./
 # Install dependencies
 RUN npm install --omit=dev
 
+# Bust cache for application code on every CI build
+ARG CACHE_BUST=1
+
 # Copy source code
 COPY src/ ./src/
 
