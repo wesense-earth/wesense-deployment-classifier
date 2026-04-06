@@ -474,18 +474,42 @@ function printReport(results) {
 
 /**
  * Import remote classification snapshots from the archive replicator.
- * Downloads _classifications/latest.json blobs from peers and feeds them
- * into the meshtastic ingester's classification cache so new readings
- * get the correct deployment_type at write time.
- *
- * TODO: The import path needs more design work:
- * - The meshtastic ingester has its own classification cache (JSON file)
- * - Remote classifications should be merged into that cache
- * - Merge rule: highest confidence wins per device_id
- * - This may require the classifier to write to the ingester's cache file
- *   or a shared cache location
- * For now, export works and blobs replicate. Import is manual.
+ * Downloads _classifications/latest.json, merges with local classifications
+ * (highest confidence wins), and applies to ClickHouse.
  */
+async function importRemoteClassifications() {
+    if (!ARCHIVE_REPLICATOR_URL) return;
+
+    const url = `${ARCHIVE_REPLICATOR_URL.replace(/\/$/, '')}/blobs/_classifications/latest.json`;
+
+    try {
+        const resp = await fetch(url, { signal: AbortSignal.timeout(10000) });
+        if (!resp.ok) return;
+
+        const snapshot = await resp.json();
+        if (!snapshot.classifications || !Array.isArray(snapshot.classifications)) return;
+
+        // Convert remote classifications to the format applyClassifications expects
+        const remoteResults = snapshot.classifications
+            .filter(c => c.device_id && c.deployment_type && c.deployment_type !== 'UNKNOWN')
+            .map(c => ({
+                device_id: c.device_id,
+                inferred_deployment_type: c.deployment_type,
+                deployment_confidence: c.confidence || 0,
+                node_name: c.node_name || '',
+                weather_api_failed: false,
+            }));
+
+        if (remoteResults.length === 0) return;
+
+        console.log(`Importing ${remoteResults.length} remote classifications from ${snapshot.node_id || 'unknown'} (exported ${snapshot.exported_at})`);
+
+        // Apply without overwrite — only fills in devices with blank deployment_type
+        await applyClassifications(remoteResults, false);
+    } catch (e) {
+        console.log(`No remote classifications available: ${e.message}`);
+    }
+}
 
 /**
  * Export classification snapshot to the archive replicator for P2P distribution.
@@ -741,6 +765,10 @@ async function runClassifier(days = 7, shouldApply = false, overwrite = false, u
         }
         return null;
     }
+
+    // Import remote classifications from peers before running local classifier.
+    // This fills in deployment_type for devices that other guardians have classified.
+    await importRemoteClassifications();
 
     // Classify eligible sensors
     const results = await classifyAllSensors(sensorsToEvaluate, days);
