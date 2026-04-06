@@ -868,11 +868,6 @@ async function runClassifier(days = 7, shouldApply = false, overwrite = false, u
     // Get sensors (filtered to Meshtastic/HomeAssistant sensors with enough data for classification)
     // WeSense sensors are excluded - they have calibrated sensors and don't need classification
     console.log('Fetching sensors from ClickHouse (minimum 24 temperature readings required)...');
-    // Import remote classifications from peers first — this applies classifications
-    // from other guardians to devices that exist locally but haven't been classified yet.
-    // Must run before the sensor fetch since it fills in deployment_type which affects
-    // which sensors need local classification.
-    await importRemoteClassifications();
 
     const sensors = await getSensors();
     console.log(`Found ${sensors.length} sensors with sufficient data for classification\n`);
@@ -931,6 +926,8 @@ async function runClassifier(days = 7, shouldApply = false, overwrite = false, u
             if (pruned > 0) console.log(`Pruned ${pruned} removed devices from state`);
             state.save();
         }
+        // Still export — we have historical classifications even if nothing was evaluated this cycle
+        await exportClassificationSnapshot();
         return null;
     }
 
@@ -1016,7 +1013,23 @@ async function startScheduler() {
     console.log(`Started at: ${new Date().toISOString()}`);
     console.log('='.repeat(80) + '\n');
 
-    // Optionally run immediately on startup
+    // On startup: export existing classifications immediately (fast — just reads state file + CH metadata)
+    // and import from peers. This ensures data flows before the slow classification cycle runs.
+    console.log('Exporting existing classifications on startup...\n');
+    try {
+        await exportClassificationSnapshot();
+    } catch (error) {
+        console.error('Startup export failed:', error);
+    }
+
+    console.log('Importing remote classifications on startup...\n');
+    try {
+        await importRemoteClassifications();
+    } catch (error) {
+        console.error('Startup import failed:', error);
+    }
+
+    // Optionally run full classification immediately on startup
     if (RUN_ON_STARTUP) {
         console.log('Running initial classification...\n');
         try {
@@ -1028,7 +1041,17 @@ async function startScheduler() {
         console.log('Waiting for scheduled run (use RUN_ON_STARTUP=true to run immediately)\n');
     }
 
-    // Schedule future runs
+    // Re-import after 5 minutes to catch peers that were still starting up
+    setTimeout(async () => {
+        console.log(`\n[${new Date().toISOString()}] Delayed import (5 min after startup)...\n`);
+        try {
+            await importRemoteClassifications();
+        } catch (error) {
+            console.error('Delayed import failed:', error);
+        }
+    }, 5 * 60 * 1000);
+
+    // Schedule future classification runs
     cron.default.schedule(SCHEDULE, async () => {
         console.log(`\n[${new Date().toISOString()}] Scheduled classification starting...\n`);
         try {
