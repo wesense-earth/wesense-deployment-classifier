@@ -1051,14 +1051,15 @@ async function startScheduler() {
         }
     }, 5 * 60 * 1000);
 
-    // Schedule future classification runs
+    // Schedule future runs: import from peers, then classify, then export
     cron.default.schedule(SCHEDULE, async () => {
-        console.log(`\n[${new Date().toISOString()}] Scheduled classification starting...\n`);
+        console.log(`\n[${new Date().toISOString()}] Scheduled run starting...\n`);
         try {
+            await importRemoteClassifications();
             await runClassifier(days, shouldApply);
-            console.log(`[${new Date().toISOString()}] Scheduled classification complete.\n`);
+            console.log(`[${new Date().toISOString()}] Scheduled run complete.\n`);
         } catch (error) {
-            console.error(`[${new Date().toISOString()}] Scheduled classification failed:`, error);
+            console.error(`[${new Date().toISOString()}] Scheduled run failed:`, error);
         }
     });
 
