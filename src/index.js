@@ -9,7 +9,13 @@ import { ClassificationState } from './classification-state.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPORTS_DIR = path.join(__dirname, '..', 'reports');
-const ARCHIVE_REPLICATOR_URL = process.env.ARCHIVE_REPLICATOR_URL || '';
+const ARCHIVE_REPLICATOR_URL = (() => {
+    let url = process.env.ARCHIVE_REPLICATOR_URL || '';
+    if (process.env.TLS_ENABLED === 'true' && url) {
+        url = url.replace('http://', 'https://');
+    }
+    return url;
+})();
 
 // Check if running in scheduler mode
 const SCHEDULER_MODE = process.env.CLASSIFIER_MODE === 'scheduler';
