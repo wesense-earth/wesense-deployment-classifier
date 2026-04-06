@@ -765,6 +765,12 @@ async function runClassifier(days = 7, shouldApply = false, overwrite = false, u
     // Get sensors (filtered to Meshtastic/HomeAssistant sensors with enough data for classification)
     // WeSense sensors are excluded - they have calibrated sensors and don't need classification
     console.log('Fetching sensors from ClickHouse (minimum 24 temperature readings required)...');
+    // Import remote classifications from peers first — this applies classifications
+    // from other guardians to devices that exist locally but haven't been classified yet.
+    // Must run before the sensor fetch since it fills in deployment_type which affects
+    // which sensors need local classification.
+    await importRemoteClassifications();
+
     const sensors = await getSensors();
     console.log(`Found ${sensors.length} sensors with sufficient data for classification\n`);
 
@@ -824,10 +830,6 @@ async function runClassifier(days = 7, shouldApply = false, overwrite = false, u
         }
         return null;
     }
-
-    // Import remote classifications from peers before running local classifier.
-    // This fills in deployment_type for devices that other guardians have classified.
-    await importRemoteClassifications();
 
     // Classify eligible sensors
     const results = await classifyAllSensors(sensorsToEvaluate, days);
