@@ -49,7 +49,7 @@ export async function getSensors() {
             max(timestamp) as last_seen
         FROM wesense.sensor_readings
         WHERE timestamp > now() - INTERVAL 90 DAY
-          AND (data_source LIKE 'MESHTASTIC%' OR data_source = 'HOMEASSISTANT')
+          AND (upper(data_source) LIKE 'MESHTASTIC%' OR upper(data_source) = 'HOMEASSISTANT')
         GROUP BY device_id
         HAVING latitude != 0 AND longitude != 0
           AND temp_reading_count >= ${MIN_READINGS_FOR_CLASSIFICATION}

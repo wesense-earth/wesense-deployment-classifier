@@ -770,7 +770,7 @@ async function applyClassifications(results, overwrite = false) {
                 format: 'JSONEachRow'
             });
             const sourceRows = await sourceResult.json();
-            const dataSource = sourceRows[0]?.data_source || '';
+            const dataSource = (sourceRows[0]?.data_source || '').toUpperCase();
             const totalRows = sourceRows[0]?.total_rows || 0;
 
             if (!dataSource.startsWith('MESHTASTIC') && dataSource !== 'HOMEASSISTANT') {
