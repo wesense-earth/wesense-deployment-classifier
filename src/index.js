@@ -496,15 +496,24 @@ async function importRemoteClassifications() {
 
     try {
         const resp = await fetch(url, { signal: AbortSignal.timeout(10000) });
-        if (!resp.ok) return;
+        if (!resp.ok) {
+            console.log(`Remote classifications not available (HTTP ${resp.status})`);
+            return;
+        }
 
         const snapshot = await resp.json();
-        if (!snapshot.classifications || !Array.isArray(snapshot.classifications)) return;
+        if (!snapshot.classifications || !Array.isArray(snapshot.classifications)) {
+            console.log('Remote classification snapshot has no classifications array');
+            return;
+        }
 
         const remote = snapshot.classifications.filter(
             c => c.device_id && c.deployment_type && c.deployment_type !== 'UNKNOWN'
         );
-        if (remote.length === 0) return;
+        if (remote.length === 0) {
+            console.log(`Remote classification snapshot has ${snapshot.classifications.length} entries but none are usable (all UNKNOWN or missing fields)`);
+            return;
+        }
 
         console.log(`\nImporting remote classifications from ${snapshot.node_id || 'unknown'} (${remote.length} devices, exported ${snapshot.exported_at})`);
 
@@ -554,7 +563,10 @@ async function importRemoteClassifications() {
                     inferred_deployment_type: rc.deployment_type,
                     deployment_confidence: rc.confidence,
                     node_name: rc.node_name || '',
+                    latitude: rc.latitude || 0,
+                    longitude: rc.longitude || 0,
                     weather_api_failed: false,
+                    is_remote: true,
                 });
             } else {
                 skippedLowerConfidence++;
@@ -580,25 +592,94 @@ async function importRemoteClassifications() {
  * Export classification snapshot to the archive replicator for P2P distribution.
  * Other guardians download this blob and merge it with their local classifications.
  * Merge rule: highest confidence wins, then most recent timestamp.
+ *
+ * Exports ALL known classifications from the state file, not just the current run.
+ * This ensures new peers get the full picture, not just whatever was evaluated this cycle.
  */
-async function exportClassificationSnapshot(results) {
+async function exportClassificationSnapshot() {
     if (!ARCHIVE_REPLICATOR_URL) {
         console.log('ARCHIVE_REPLICATOR_URL not set — skipping P2P classification export');
         return;
     }
 
+    // Read full classification state — this has every device ever classified
+    const stateFile = path.join(__dirname, '..', 'data', 'classification_state.json');
+    let stateData;
+    try {
+        stateData = JSON.parse(fs.readFileSync(stateFile, 'utf-8'));
+    } catch {
+        console.log('No classification state file — nothing to export');
+        return;
+    }
+
+    const devices = stateData.devices || {};
+    const classifiedIds = [];
+
+    for (const [deviceId, entry] of Object.entries(devices)) {
+        const type = entry.last_result;
+        // Only export actual classifications, not failure states or UNKNOWN
+        if (!type || type === 'UNKNOWN' || type === 'weather_api_failed' || type === 'insufficient_data' || type === 'skipped_source') {
+            continue;
+        }
+        classifiedIds.push(deviceId);
+    }
+
+    if (classifiedIds.length === 0) {
+        console.log('No classifications to export');
+        return;
+    }
+
+    // Query ClickHouse for latest non-empty name and position of each classified device.
+    // argMaxIf picks the most recent value where the field is non-empty/non-zero,
+    // so a recent reading with blank name doesn't overwrite an older one that had it.
+    const deviceList = classifiedIds.map(id => `'${id.replace(/'/g, "\\'")}'`).join(',');
+    const metaQuery = `
+        SELECT
+            device_id,
+            argMaxIf(node_name, timestamp, node_name != '') as node_name,
+            argMaxIf(latitude, timestamp, latitude != 0) as latitude,
+            argMaxIf(longitude, timestamp, longitude != 0) as longitude
+        FROM wesense.sensor_readings
+        WHERE device_id IN (${deviceList})
+          AND timestamp > now() - INTERVAL 90 DAY
+        GROUP BY device_id
+    `;
+
+    let deviceMeta = {};
+    try {
+        const result = await client.query({ query: metaQuery, format: 'JSONEachRow' });
+        const rows = await result.json();
+        for (const row of rows) {
+            deviceMeta[row.device_id] = {
+                node_name: row.node_name || '',
+                latitude: parseFloat(row.latitude) || 0,
+                longitude: parseFloat(row.longitude) || 0,
+            };
+        }
+    } catch (e) {
+        console.warn(`Failed to fetch device metadata for export: ${e.message}`);
+        // Continue without metadata — classifications are still useful
+    }
+
+    const classifications = [];
+    for (const deviceId of classifiedIds) {
+        const entry = devices[deviceId];
+        const meta = deviceMeta[deviceId] || {};
+        classifications.push({
+            device_id: deviceId,
+            deployment_type: entry.last_result,
+            confidence: entry.confidence || 0,
+            classified_at: entry.classified_at || entry.last_attempt || '',
+            node_name: meta.node_name || '',
+            latitude: meta.latitude || 0,
+            longitude: meta.longitude || 0,
+        });
+    }
+
     const snapshot = {
         exported_at: new Date().toISOString(),
         node_id: process.env.NODE_ID || 'unknown',
-        classifications: results
-            .filter(r => r.device_id && r.inferred_deployment_type && !r.weather_api_failed)
-            .map(r => ({
-                device_id: r.device_id,
-                deployment_type: r.inferred_deployment_type,
-                confidence: r.deployment_confidence || 0,
-                classified_at: new Date().toISOString(),
-                node_name: r.node_name || '',
-            }))
+        classifications,
     };
 
     const blob = Buffer.from(JSON.stringify(snapshot));
@@ -727,6 +808,22 @@ async function applyClassifications(results, overwrite = false) {
                 query_params: { deviceId, deploymentType }
             });
 
+            // For remote imports: also fill in node_name and position on rows where they're blank
+            if (result.is_remote) {
+                if (result.node_name) {
+                    await client.command({
+                        query: `ALTER TABLE wesense.sensor_readings UPDATE node_name = {nodeName:String} WHERE device_id = {deviceId:String} AND (node_name = '' OR node_name IS NULL)`,
+                        query_params: { deviceId, nodeName: result.node_name }
+                    });
+                }
+                if (result.latitude && result.longitude) {
+                    await client.command({
+                        query: `ALTER TABLE wesense.sensor_readings UPDATE latitude = {lat:Float64}, longitude = {lng:Float64} WHERE device_id = {deviceId:String} AND (latitude = 0 OR longitude = 0)`,
+                        query_params: { deviceId, lat: result.latitude, lng: result.longitude }
+                    });
+                }
+            }
+
             const clearedNote = displayType === 'UNKNOWN' ? ' [cleared]' : '';
             console.log(`${progress} ${name} → ${displayType}${clearedNote} (${rowCount}/${totalRows} rows updated)`);
             updated++;
@@ -852,7 +949,7 @@ async function runClassifier(days = 7, shouldApply = false, overwrite = false, u
     }
 
     // Export classification snapshot for P2P distribution
-    await exportClassificationSnapshot(results);
+    await exportClassificationSnapshot();
 
     // Record results in state and save
     if (useSmartScheduling) {
