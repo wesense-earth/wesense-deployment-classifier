@@ -133,7 +133,7 @@ export class ClassificationState {
      * @param {number} rowCount - current reading count
      * @param {string|null} classification - the actual type (INDOOR, OUTDOOR, etc.) if result === "classified"
      */
-    recordResult(deviceId, result, rowCount, classification = null) {
+    recordResult(deviceId, result, rowCount, classification = null, confidence = 0) {
         const now = new Date();
         const existing = this.state.devices[deviceId] || {
             attempts: 0,
@@ -154,6 +154,8 @@ export class ClassificationState {
             // Successfully classified — re-evaluate in 7 days
             entry.consecutive_skips = 0;
             entry.skip_reason = null;
+            entry.confidence = confidence;
+            entry.classified_at = now.toISOString();
             entry.next_eligible = new Date(now.getTime() + SUCCESSFUL_REEVAL_DAYS * 24 * 60 * 60 * 1000).toISOString();
         } else {
             // Failed — apply exponential backoff

@@ -474,8 +474,14 @@ function printReport(results) {
 
 /**
  * Import remote classification snapshots from the archive replicator.
- * Downloads _classifications/latest.json, merges with local classifications
- * (highest confidence wins), and applies to ClickHouse.
+ * Downloads _classifications/latest.json, compares confidence scores
+ * against local classifications, and applies where remote is better.
+ *
+ * Merge rules per device:
+ *   1. Remote has classification, local is blank/unknown → apply remote
+ *   2. Both have classification, remote confidence > local → apply remote
+ *   3. Both have classification, same confidence, remote is newer → apply remote
+ *   4. Otherwise → keep local
  */
 async function importRemoteClassifications() {
     if (!ARCHIVE_REPLICATOR_URL) return;
@@ -489,25 +495,78 @@ async function importRemoteClassifications() {
         const snapshot = await resp.json();
         if (!snapshot.classifications || !Array.isArray(snapshot.classifications)) return;
 
-        // Convert remote classifications to the format applyClassifications expects
-        const remoteResults = snapshot.classifications
-            .filter(c => c.device_id && c.deployment_type && c.deployment_type !== 'UNKNOWN')
-            .map(c => ({
-                device_id: c.device_id,
-                inferred_deployment_type: c.deployment_type,
-                deployment_confidence: c.confidence || 0,
-                node_name: c.node_name || '',
-                weather_api_failed: false,
-            }));
+        const remote = snapshot.classifications.filter(
+            c => c.device_id && c.deployment_type && c.deployment_type !== 'UNKNOWN'
+        );
+        if (remote.length === 0) return;
 
-        if (remoteResults.length === 0) return;
+        console.log(`\nImporting remote classifications from ${snapshot.node_id || 'unknown'} (${remote.length} devices, exported ${snapshot.exported_at})`);
 
-        console.log(`Importing ${remoteResults.length} remote classifications from ${snapshot.node_id || 'unknown'} (exported ${snapshot.exported_at})`);
+        // Load local classification state to compare confidence
+        const stateFile = path.join(__dirname, '..', 'data', 'classification_state.json');
+        let localState = {};
+        try {
+            const data = JSON.parse(fs.readFileSync(stateFile, 'utf-8'));
+            localState = data.devices || {};
+        } catch {
+            // No local state — all remote classifications win
+        }
 
-        // Apply without overwrite — only fills in devices with blank deployment_type
-        await applyClassifications(remoteResults, false);
+        let applied = 0;
+        let skippedLowerConfidence = 0;
+        let skippedNoDevice = 0;
+        const toApply = [];
+
+        for (const rc of remote) {
+            const local = localState[rc.device_id];
+            const localConfidence = local?.confidence || 0;
+            const localClassifiedAt = local?.classified_at || '';
+            const localType = local?.last_result || '';
+
+            // Merge decision
+            let shouldApply = false;
+
+            // Ignore remote classifications older than 30 days — sensor may have moved
+            const maxAge = 30 * 24 * 60 * 60 * 1000;
+            const remoteAge = Date.now() - new Date(rc.classified_at).getTime();
+            if (remoteAge > maxAge) continue;
+
+            if (!localType || localType === '' || localType === 'unknown' || localType === 'UNKNOWN') {
+                // Local has no classification — apply remote
+                shouldApply = true;
+            } else if (rc.confidence > localConfidence) {
+                // Remote has higher confidence — apply remote
+                shouldApply = true;
+            } else if (rc.confidence === localConfidence && rc.classified_at > localClassifiedAt) {
+                // Same confidence, remote is newer — apply remote
+                shouldApply = true;
+            }
+
+            if (shouldApply) {
+                toApply.push({
+                    device_id: rc.device_id,
+                    inferred_deployment_type: rc.deployment_type,
+                    deployment_confidence: rc.confidence,
+                    node_name: rc.node_name || '',
+                    weather_api_failed: false,
+                });
+            } else {
+                skippedLowerConfidence++;
+            }
+        }
+
+        if (toApply.length > 0) {
+            console.log(`Applying ${toApply.length} remote classifications (skipped ${skippedLowerConfidence} with lower confidence)`);
+            await applyClassifications(toApply, true); // overwrite=true since we already checked confidence
+            applied = toApply.length;
+        } else {
+            console.log(`No remote classifications to apply (${skippedLowerConfidence} skipped — local confidence is higher or equal)`);
+        }
+
+        return applied;
     } catch (e) {
         console.log(`No remote classifications available: ${e.message}`);
+        return 0;
     }
 }
 
@@ -798,7 +857,7 @@ async function runClassifier(days = 7, shouldApply = false, overwrite = false, u
             } else if (result.inferred_deployment_type === 'UNKNOWN' && result.deployment_confidence === 0) {
                 state.recordResult(result.device_id, 'insufficient_data', rowCount);
             } else {
-                state.recordResult(result.device_id, 'classified', rowCount, result.inferred_deployment_type);
+                state.recordResult(result.device_id, 'classified', rowCount, result.inferred_deployment_type, result.deployment_confidence || 0);
             }
         }
 
