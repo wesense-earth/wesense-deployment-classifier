@@ -9,6 +9,7 @@ import { ClassificationState } from './classification-state.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPORTS_DIR = path.join(__dirname, '..', 'reports');
+const ARCHIVE_REPLICATOR_URL = process.env.ARCHIVE_REPLICATOR_URL || '';
 
 // Check if running in scheduler mode
 const SCHEDULER_MODE = process.env.CLASSIFIER_MODE === 'scheduler';
@@ -472,6 +473,68 @@ function printReport(results) {
 }
 
 /**
+ * Import remote classification snapshots from the archive replicator.
+ * Downloads _classifications/latest.json blobs from peers and feeds them
+ * into the meshtastic ingester's classification cache so new readings
+ * get the correct deployment_type at write time.
+ *
+ * TODO: The import path needs more design work:
+ * - The meshtastic ingester has its own classification cache (JSON file)
+ * - Remote classifications should be merged into that cache
+ * - Merge rule: highest confidence wins per device_id
+ * - This may require the classifier to write to the ingester's cache file
+ *   or a shared cache location
+ * For now, export works and blobs replicate. Import is manual.
+ */
+
+/**
+ * Export classification snapshot to the archive replicator for P2P distribution.
+ * Other guardians download this blob and merge it with their local classifications.
+ * Merge rule: highest confidence wins, then most recent timestamp.
+ */
+async function exportClassificationSnapshot(results) {
+    if (!ARCHIVE_REPLICATOR_URL) {
+        console.log('ARCHIVE_REPLICATOR_URL not set — skipping P2P classification export');
+        return;
+    }
+
+    const snapshot = {
+        exported_at: new Date().toISOString(),
+        node_id: process.env.NODE_ID || 'unknown',
+        classifications: results
+            .filter(r => r.device_id && r.inferred_deployment_type && !r.weather_api_failed)
+            .map(r => ({
+                device_id: r.device_id,
+                deployment_type: r.inferred_deployment_type,
+                confidence: r.deployment_confidence || 0,
+                classified_at: new Date().toISOString(),
+                node_name: r.node_name || '',
+            }))
+    };
+
+    const blob = Buffer.from(JSON.stringify(snapshot));
+    const url = `${ARCHIVE_REPLICATOR_URL.replace(/\/$/, '')}/blobs/_classifications/latest.json`;
+
+    try {
+        const resp = await fetch(url, {
+            method: 'PUT',
+            body: blob,
+            headers: { 'Content-Type': 'application/octet-stream' },
+            signal: AbortSignal.timeout(30000),
+        });
+
+        if (resp.ok) {
+            const result = await resp.json();
+            console.log(`Classification snapshot exported to archive replicator (${snapshot.classifications.length} devices, hash=${result.hash?.slice(0, 16)})`);
+        } else {
+            console.warn(`Failed to export classification snapshot: HTTP ${resp.status}`);
+        }
+    } catch (e) {
+        console.warn(`Failed to export classification snapshot: ${e.message}`);
+    }
+}
+
+/**
  * Apply classifications to ClickHouse database
  * Only updates Meshtastic sensors
  * @param {Array} results - Classification results
@@ -692,6 +755,9 @@ async function runClassifier(days = 7, shouldApply = false, overwrite = false, u
     if (shouldApply) {
         await applyClassifications(results, overwrite);
     }
+
+    // Export classification snapshot for P2P distribution
+    await exportClassificationSnapshot(results);
 
     // Record results in state and save
     if (useSmartScheduling) {
