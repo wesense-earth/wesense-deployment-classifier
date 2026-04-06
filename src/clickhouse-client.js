@@ -1,11 +1,27 @@
 import { createClient } from '@clickhouse/client';
+import fs from 'fs';
 
-const client = createClient({
-    url: process.env.CLICKHOUSE_HOST || 'http://localhost:8123',
+const tlsEnabled = process.env.TLS_ENABLED === 'true';
+const defaultUrl = tlsEnabled ? 'https://clickhouse:8443' : 'http://localhost:8123';
+const clickhouseUrl = tlsEnabled
+    ? (process.env.CLICKHOUSE_HOST || defaultUrl).replace('http://', 'https://').replace(':8123', ':8443')
+    : (process.env.CLICKHOUSE_HOST || defaultUrl);
+
+const clientOpts = {
+    url: clickhouseUrl,
     username: process.env.CLICKHOUSE_USER || 'wesense',
     password: process.env.CLICKHOUSE_PASSWORD || '',
     database: process.env.CLICKHOUSE_DATABASE || 'wesense'
-});
+};
+
+if (tlsEnabled) {
+    const caFile = process.env.TLS_CA_CERTFILE;
+    if (caFile && fs.existsSync(caFile)) {
+        clientOpts.tls = { ca_cert: fs.readFileSync(caFile) };
+    }
+}
+
+const client = createClient(clientOpts);
 
 // Minimum temperature readings required for classification
 // - Mobility analysis needs 10+ readings
