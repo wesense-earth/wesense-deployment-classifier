@@ -5,9 +5,17 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { getSensors, client } from './clickhouse-client.js';
 import { classifySensor, classifyAllSensors, THRESHOLDS } from './classifier.js';
+import { ClassificationState } from './classification-state.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPORTS_DIR = path.join(__dirname, '..', 'reports');
+const ARCHIVE_REPLICATOR_URL = (() => {
+    let url = process.env.ARCHIVE_REPLICATOR_URL || '';
+    if (process.env.TLS_ENABLED === 'true' && url) {
+        url = url.replace('http://', 'https://');
+    }
+    return url;
+})();
 
 // Check if running in scheduler mode
 const SCHEDULER_MODE = process.env.CLASSIFIER_MODE === 'scheduler';
@@ -471,6 +479,232 @@ function printReport(results) {
 }
 
 /**
+ * Import remote classification snapshots from the archive replicator.
+ * Downloads _classifications/latest.json, compares confidence scores
+ * against local classifications, and applies where remote is better.
+ *
+ * Merge rules per device:
+ *   1. Remote has classification, local is blank/unknown → apply remote
+ *   2. Both have classification, remote confidence > local → apply remote
+ *   3. Both have classification, same confidence, remote is newer → apply remote
+ *   4. Otherwise → keep local
+ */
+async function importRemoteClassifications() {
+    if (!ARCHIVE_REPLICATOR_URL) return;
+
+    const url = `${ARCHIVE_REPLICATOR_URL.replace(/\/$/, '')}/blobs/_classifications/latest.json`;
+
+    try {
+        const resp = await fetch(url, { signal: AbortSignal.timeout(10000) });
+        if (!resp.ok) {
+            console.log(`Remote classifications not available (HTTP ${resp.status})`);
+            return;
+        }
+
+        const snapshot = await resp.json();
+        if (!snapshot.classifications || !Array.isArray(snapshot.classifications)) {
+            console.log('Remote classification snapshot has no classifications array');
+            return;
+        }
+
+        const remote = snapshot.classifications.filter(
+            c => c.device_id && c.deployment_type && c.deployment_type !== 'UNKNOWN'
+        );
+        if (remote.length === 0) {
+            console.log(`Remote classification snapshot has ${snapshot.classifications.length} entries but none are usable (all UNKNOWN or missing fields)`);
+            return;
+        }
+
+        console.log(`\nImporting remote classifications from ${snapshot.node_id || 'unknown'} (${remote.length} devices, exported ${snapshot.exported_at})`);
+
+        // Load local classification state to compare confidence
+        const stateFile = path.join(__dirname, '..', 'data', 'classification_state.json');
+        let localState = {};
+        try {
+            const data = JSON.parse(fs.readFileSync(stateFile, 'utf-8'));
+            localState = data.devices || {};
+        } catch {
+            // No local state — all remote classifications win
+        }
+
+        let applied = 0;
+        let skippedLowerConfidence = 0;
+        let skippedNoDevice = 0;
+        const toApply = [];
+
+        for (const rc of remote) {
+            const local = localState[rc.device_id];
+            const localConfidence = local?.confidence || 0;
+            const localClassifiedAt = local?.classified_at || '';
+            const localType = local?.last_result || '';
+
+            // Merge decision
+            let shouldApply = false;
+
+            // Ignore remote classifications older than 30 days — sensor may have moved
+            const maxAge = 30 * 24 * 60 * 60 * 1000;
+            const remoteAge = Date.now() - new Date(rc.classified_at).getTime();
+            if (remoteAge > maxAge) continue;
+
+            if (!localType || localType === '' || localType === 'unknown' || localType === 'UNKNOWN') {
+                // Local has no classification — apply remote
+                shouldApply = true;
+            } else if (rc.confidence > localConfidence) {
+                // Remote has higher confidence — apply remote
+                shouldApply = true;
+            } else if (rc.confidence === localConfidence && rc.classified_at > localClassifiedAt) {
+                // Same confidence, remote is newer — apply remote
+                shouldApply = true;
+            }
+
+            if (shouldApply) {
+                toApply.push({
+                    device_id: rc.device_id,
+                    inferred_deployment_type: rc.deployment_type,
+                    deployment_confidence: rc.confidence,
+                    node_name: rc.node_name || '',
+                    latitude: rc.latitude || 0,
+                    longitude: rc.longitude || 0,
+                    weather_api_failed: false,
+                    is_remote: true,
+                });
+            } else {
+                skippedLowerConfidence++;
+            }
+        }
+
+        if (toApply.length > 0) {
+            console.log(`Applying ${toApply.length} remote classifications (skipped ${skippedLowerConfidence} with lower confidence)`);
+            await applyClassifications(toApply, true); // overwrite=true since we already checked confidence
+            applied = toApply.length;
+        } else {
+            console.log(`No remote classifications to apply (${skippedLowerConfidence} skipped — local confidence is higher or equal)`);
+        }
+
+        return applied;
+    } catch (e) {
+        console.log(`No remote classifications available: ${e.message}`);
+        return 0;
+    }
+}
+
+/**
+ * Export classification snapshot to the archive replicator for P2P distribution.
+ * Other guardians download this blob and merge it with their local classifications.
+ * Merge rule: highest confidence wins, then most recent timestamp.
+ *
+ * Exports ALL known classifications from the state file, not just the current run.
+ * This ensures new peers get the full picture, not just whatever was evaluated this cycle.
+ */
+async function exportClassificationSnapshot() {
+    if (!ARCHIVE_REPLICATOR_URL) {
+        console.log('ARCHIVE_REPLICATOR_URL not set — skipping P2P classification export');
+        return;
+    }
+
+    // Read full classification state — this has every device ever classified
+    const stateFile = path.join(__dirname, '..', 'data', 'classification_state.json');
+    let stateData;
+    try {
+        stateData = JSON.parse(fs.readFileSync(stateFile, 'utf-8'));
+    } catch {
+        console.log('No classification state file — nothing to export');
+        return;
+    }
+
+    const devices = stateData.devices || {};
+    const classifiedIds = [];
+
+    for (const [deviceId, entry] of Object.entries(devices)) {
+        const type = entry.last_result;
+        // Only export actual classifications, not failure states or UNKNOWN
+        if (!type || type === 'UNKNOWN' || type === 'weather_api_failed' || type === 'insufficient_data' || type === 'skipped_source') {
+            continue;
+        }
+        classifiedIds.push(deviceId);
+    }
+
+    if (classifiedIds.length === 0) {
+        console.log('No classifications to export');
+        return;
+    }
+
+    // Query ClickHouse for latest non-empty name and position of each classified device.
+    // argMaxIf picks the most recent value where the field is non-empty/non-zero,
+    // so a recent reading with blank name doesn't overwrite an older one that had it.
+    const deviceList = classifiedIds.map(id => `'${id.replace(/'/g, "\\'")}'`).join(',');
+    const metaQuery = `
+        SELECT
+            device_id,
+            argMaxIf(node_name, timestamp, node_name != '') as node_name,
+            argMaxIf(latitude, timestamp, latitude != 0) as latitude,
+            argMaxIf(longitude, timestamp, longitude != 0) as longitude
+        FROM wesense.sensor_readings
+        WHERE device_id IN (${deviceList})
+          AND timestamp > now() - INTERVAL 90 DAY
+        GROUP BY device_id
+    `;
+
+    let deviceMeta = {};
+    try {
+        const result = await client.query({ query: metaQuery, format: 'JSONEachRow' });
+        const rows = await result.json();
+        for (const row of rows) {
+            deviceMeta[row.device_id] = {
+                node_name: row.node_name || '',
+                latitude: parseFloat(row.latitude) || 0,
+                longitude: parseFloat(row.longitude) || 0,
+            };
+        }
+    } catch (e) {
+        console.warn(`Failed to fetch device metadata for export: ${e.message}`);
+        // Continue without metadata — classifications are still useful
+    }
+
+    const classifications = [];
+    for (const deviceId of classifiedIds) {
+        const entry = devices[deviceId];
+        const meta = deviceMeta[deviceId] || {};
+        classifications.push({
+            device_id: deviceId,
+            deployment_type: entry.last_result,
+            confidence: entry.confidence || 0,
+            classified_at: entry.classified_at || entry.last_attempt || '',
+            node_name: meta.node_name || '',
+            latitude: meta.latitude || 0,
+            longitude: meta.longitude || 0,
+        });
+    }
+
+    const snapshot = {
+        exported_at: new Date().toISOString(),
+        node_id: process.env.NODE_ID || 'unknown',
+        classifications,
+    };
+
+    const blob = Buffer.from(JSON.stringify(snapshot));
+    const url = `${ARCHIVE_REPLICATOR_URL.replace(/\/$/, '')}/blobs/_classifications/latest.json`;
+
+    try {
+        const resp = await fetch(url, {
+            method: 'PUT',
+            body: blob,
+            headers: { 'Content-Type': 'application/octet-stream' },
+            signal: AbortSignal.timeout(30000),
+        });
+
+        if (resp.ok) {
+            const result = await resp.json();
+            console.log(`Classification snapshot exported to archive replicator (${snapshot.classifications.length} devices, hash=${result.hash?.slice(0, 16)})`);
+        } else {
+            console.warn(`Failed to export classification snapshot: HTTP ${resp.status}`);
+        }
+    } catch (e) {
+        console.warn(`Failed to export classification snapshot: ${e.message}`);
+    }
+}
+
+/**
  * Apply classifications to ClickHouse database
  * Only updates Meshtastic sensors
  * @param {Array} results - Classification results
@@ -536,7 +770,7 @@ async function applyClassifications(results, overwrite = false) {
                 format: 'JSONEachRow'
             });
             const sourceRows = await sourceResult.json();
-            const dataSource = sourceRows[0]?.data_source || '';
+            const dataSource = (sourceRows[0]?.data_source || '').toUpperCase();
             const totalRows = sourceRows[0]?.total_rows || 0;
 
             if (!dataSource.startsWith('MESHTASTIC') && dataSource !== 'HOMEASSISTANT') {
@@ -574,6 +808,22 @@ async function applyClassifications(results, overwrite = false) {
                 query_params: { deviceId, deploymentType }
             });
 
+            // For remote imports: also fill in node_name and position on rows where they're blank
+            if (result.is_remote) {
+                if (result.node_name) {
+                    await client.command({
+                        query: `ALTER TABLE wesense.sensor_readings UPDATE node_name = {nodeName:String} WHERE device_id = {deviceId:String} AND (node_name = '' OR node_name IS NULL)`,
+                        query_params: { deviceId, nodeName: result.node_name }
+                    });
+                }
+                if (result.latitude && result.longitude) {
+                    await client.command({
+                        query: `ALTER TABLE wesense.sensor_readings UPDATE latitude = {lat:Float64}, longitude = {lng:Float64} WHERE device_id = {deviceId:String} AND (latitude = 0 OR longitude = 0)`,
+                        query_params: { deviceId, lat: result.latitude, lng: result.longitude }
+                    });
+                }
+            }
+
             const clearedNote = displayType === 'UNKNOWN' ? ' [cleared]' : '';
             console.log(`${progress} ${name} → ${displayType}${clearedNote} (${rowCount}/${totalRows} rows updated)`);
             updated++;
@@ -596,14 +846,29 @@ async function applyClassifications(results, overwrite = false) {
 
 /**
  * Run the classifier (used by both manual and scheduled modes)
+ * @param {number} days - Days of weather data to use
+ * @param {boolean} shouldApply - Whether to apply classifications to database
+ * @param {boolean} overwrite - Whether to overwrite existing classifications
+ * @param {boolean} useSmartScheduling - Whether to use state-based filtering (default true in scheduler mode)
  */
-async function runClassifier(days = 7, shouldApply = false, overwrite = false) {
+async function runClassifier(days = 7, shouldApply = false, overwrite = false, useSmartScheduling = SCHEDULER_MODE) {
     console.log('Sensor Deployment Classifier');
     console.log(`Using 90 days history for variance/mobility, ${days} days for weather correlation\n`);
+
+    // Load classification state for smart scheduling
+    const state = new ClassificationState();
+    if (useSmartScheduling) {
+        state.load();
+        const stateStats = state.getStats();
+        if (stateStats.total_tracked > 0) {
+            console.log(`Classification state: ${stateStats.total_tracked} tracked devices (${stateStats.eligible_now} eligible, ${stateStats.backing_off} backing off)`);
+        }
+    }
 
     // Get sensors (filtered to Meshtastic/HomeAssistant sensors with enough data for classification)
     // WeSense sensors are excluded - they have calibrated sensors and don't need classification
     console.log('Fetching sensors from ClickHouse (minimum 24 temperature readings required)...');
+
     const sensors = await getSensors();
     console.log(`Found ${sensors.length} sensors with sufficient data for classification\n`);
 
@@ -612,8 +877,62 @@ async function runClassifier(days = 7, shouldApply = false, overwrite = false) {
         return null;
     }
 
-    // Classify all sensors
-    const results = await classifyAllSensors(sensors, days);
+    // Smart scheduling: filter sensors through state
+    let sensorsToEvaluate = sensors;
+    const skippedSensors = [];
+
+    if (useSmartScheduling) {
+        sensorsToEvaluate = [];
+        const skipReasons = {};
+        const evalReasons = {};
+
+        for (const sensor of sensors) {
+            const rowCount = parseInt(sensor.reading_count) || 0;
+            const { evaluate, reason } = state.shouldEvaluate(sensor.device_id, rowCount);
+
+            if (evaluate) {
+                sensorsToEvaluate.push(sensor);
+                evalReasons[reason] = (evalReasons[reason] || 0) + 1;
+            } else {
+                skippedSensors.push(sensor);
+                // Aggregate skip reasons for summary
+                const key = reason.split(',')[0]; // e.g. "insufficient_data"
+                skipReasons[key] = (skipReasons[key] || 0) + 1;
+            }
+        }
+
+        console.log(`Smart scheduling: evaluating ${sensorsToEvaluate.length} of ${sensors.length} sensors`);
+        if (sensorsToEvaluate.length > 0) {
+            console.log('  Evaluating:');
+            for (const [reason, count] of Object.entries(evalReasons).sort((a, b) => b[1] - a[1])) {
+                console.log(`    ${reason}: ${count}`);
+            }
+        }
+        if (skippedSensors.length > 0) {
+            console.log(`  Skipping ${skippedSensors.length} (backoff):`);
+            for (const [reason, count] of Object.entries(skipReasons).sort((a, b) => b[1] - a[1])) {
+                console.log(`    ${reason}: ${count}`);
+            }
+        }
+        console.log('');
+    }
+
+    if (sensorsToEvaluate.length === 0) {
+        console.log('No sensors eligible for evaluation this run (all in backoff).');
+        if (useSmartScheduling) {
+            // Prune removed devices
+            const activeIds = new Set(sensors.map(s => s.device_id));
+            const pruned = state.prune(activeIds);
+            if (pruned > 0) console.log(`Pruned ${pruned} removed devices from state`);
+            state.save();
+        }
+        // Still export — we have historical classifications even if nothing was evaluated this cycle
+        await exportClassificationSnapshot();
+        return null;
+    }
+
+    // Classify eligible sensors
+    const results = await classifyAllSensors(sensorsToEvaluate, days);
 
     // Print report
     printReport(results);
@@ -624,6 +943,51 @@ async function runClassifier(days = 7, shouldApply = false, overwrite = false) {
     // Apply to database if requested
     if (shouldApply) {
         await applyClassifications(results, overwrite);
+    }
+
+    // Export classification snapshot for P2P distribution
+    await exportClassificationSnapshot();
+
+    // Record results in state and save
+    if (useSmartScheduling) {
+        for (const result of results) {
+            const sensor = sensorsToEvaluate.find(s => s.device_id === result.device_id);
+            const rowCount = sensor ? parseInt(sensor.reading_count) || 0 : 0;
+
+            if (result.weather_api_failed) {
+                state.recordResult(result.device_id, 'weather_api_failed', rowCount);
+            } else if (result.inferred_deployment_type === 'UNKNOWN' && result.deployment_confidence === 0) {
+                state.recordResult(result.device_id, 'insufficient_data', rowCount);
+            } else {
+                state.recordResult(result.device_id, 'classified', rowCount, result.inferred_deployment_type, result.deployment_confidence || 0);
+            }
+        }
+
+        // Prune devices no longer in ClickHouse
+        const activeIds = new Set(sensors.map(s => s.device_id));
+        const pruned = state.prune(activeIds);
+        if (pruned > 0) console.log(`Pruned ${pruned} removed devices from state`);
+
+        state.save();
+
+        // Log summary of what next run will look like
+        const postStats = state.getStats();
+        console.log('\nSmart scheduling summary:');
+        console.log(`  Devices tracked: ${postStats.total_tracked}`);
+        console.log(`  Will evaluate next run: ${postStats.eligible_now} (new/expired backoff)`);
+        console.log(`  Will skip next run: ${postStats.backing_off} (in backoff)`);
+        if (Object.keys(postStats.by_last_result).length > 0) {
+            console.log('  By last result:');
+            for (const [result, count] of Object.entries(postStats.by_last_result).sort((a, b) => b[1] - a[1])) {
+                console.log(`    ${result}: ${count}`);
+            }
+        }
+        if (Object.keys(postStats.by_skip_reason).length > 0) {
+            console.log('  Backing off:');
+            for (const [reason, count] of Object.entries(postStats.by_skip_reason).sort((a, b) => b[1] - a[1])) {
+                console.log(`    ${reason}: ${count}`);
+            }
+        }
     }
 
     return results;
@@ -649,7 +1013,23 @@ async function startScheduler() {
     console.log(`Started at: ${new Date().toISOString()}`);
     console.log('='.repeat(80) + '\n');
 
-    // Optionally run immediately on startup
+    // On startup: export existing classifications immediately (fast — just reads state file + CH metadata)
+    // and import from peers. This ensures data flows before the slow classification cycle runs.
+    console.log('Exporting existing classifications on startup...\n');
+    try {
+        await exportClassificationSnapshot();
+    } catch (error) {
+        console.error('Startup export failed:', error);
+    }
+
+    console.log('Importing remote classifications on startup...\n');
+    try {
+        await importRemoteClassifications();
+    } catch (error) {
+        console.error('Startup import failed:', error);
+    }
+
+    // Optionally run full classification immediately on startup
     if (RUN_ON_STARTUP) {
         console.log('Running initial classification...\n');
         try {
@@ -661,14 +1041,25 @@ async function startScheduler() {
         console.log('Waiting for scheduled run (use RUN_ON_STARTUP=true to run immediately)\n');
     }
 
-    // Schedule future runs
-    cron.default.schedule(SCHEDULE, async () => {
-        console.log(`\n[${new Date().toISOString()}] Scheduled classification starting...\n`);
+    // Re-import after 5 minutes to catch peers that were still starting up
+    setTimeout(async () => {
+        console.log(`\n[${new Date().toISOString()}] Delayed import (5 min after startup)...\n`);
         try {
-            await runClassifier(days, shouldApply);
-            console.log(`[${new Date().toISOString()}] Scheduled classification complete.\n`);
+            await importRemoteClassifications();
         } catch (error) {
-            console.error(`[${new Date().toISOString()}] Scheduled classification failed:`, error);
+            console.error('Delayed import failed:', error);
+        }
+    }, 5 * 60 * 1000);
+
+    // Schedule future runs: import from peers, then classify, then export
+    cron.default.schedule(SCHEDULE, async () => {
+        console.log(`\n[${new Date().toISOString()}] Scheduled run starting...\n`);
+        try {
+            await importRemoteClassifications();
+            await runClassifier(days, shouldApply);
+            console.log(`[${new Date().toISOString()}] Scheduled run complete.\n`);
+        } catch (error) {
+            console.error(`[${new Date().toISOString()}] Scheduled run failed:`, error);
         }
     });
 

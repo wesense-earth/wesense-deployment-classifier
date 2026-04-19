@@ -1,4 +1,4 @@
-FROM node:20-alpine
+FROM node:20-slim
 
 WORKDIR /app
 
@@ -6,7 +6,10 @@ WORKDIR /app
 COPY package*.json ./
 
 # Install dependencies
-RUN npm install --production
+RUN npm install --omit=dev
+
+# Bust cache for application code on every CI build
+ARG CACHE_BUST=1
 
 # Copy source code
 COPY src/ ./src/
@@ -16,7 +19,7 @@ COPY entrypoint.sh ./
 RUN chmod +x entrypoint.sh
 
 # Create directories for reports and logs
-RUN mkdir -p /app/reports /app/logs
+RUN mkdir -p /app/reports /app/logs /app/data
 
 # Environment variables (can be overridden via docker run -e)
 # Note: Configure these via docker run -e or use docker_run.sh with .env file

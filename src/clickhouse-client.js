@@ -1,11 +1,27 @@
 import { createClient } from '@clickhouse/client';
+import fs from 'fs';
 
-const client = createClient({
-    url: process.env.CLICKHOUSE_HOST || 'http://localhost:8123',
+const tlsEnabled = process.env.TLS_ENABLED === 'true';
+const defaultUrl = tlsEnabled ? 'https://clickhouse:8443' : 'http://localhost:8123';
+const clickhouseUrl = tlsEnabled
+    ? (process.env.CLICKHOUSE_HOST || defaultUrl).replace('http://', 'https://').replace(':8123', ':8443')
+    : (process.env.CLICKHOUSE_HOST || defaultUrl);
+
+const clientOpts = {
+    url: clickhouseUrl,
     username: process.env.CLICKHOUSE_USER || 'wesense',
     password: process.env.CLICKHOUSE_PASSWORD || '',
     database: process.env.CLICKHOUSE_DATABASE || 'wesense'
-});
+};
+
+if (tlsEnabled) {
+    const caFile = process.env.TLS_CA_CERTFILE;
+    if (caFile && fs.existsSync(caFile)) {
+        clientOpts.tls = { ca_cert: fs.readFileSync(caFile) };
+    }
+}
+
+const client = createClient(clientOpts);
 
 // Minimum temperature readings required for classification
 // - Mobility analysis needs 10+ readings
@@ -33,7 +49,7 @@ export async function getSensors() {
             max(timestamp) as last_seen
         FROM wesense.sensor_readings
         WHERE timestamp > now() - INTERVAL 90 DAY
-          AND (data_source LIKE 'MESHTASTIC%' OR data_source = 'HOMEASSISTANT')
+          AND (upper(data_source) LIKE 'MESHTASTIC%' OR upper(data_source) = 'HOMEASSISTANT')
         GROUP BY device_id
         HAVING latitude != 0 AND longitude != 0
           AND temp_reading_count >= ${MIN_READINGS_FOR_CLASSIFICATION}
