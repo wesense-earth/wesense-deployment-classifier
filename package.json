@@ -13,7 +13,7 @@
   },
   "dependencies": {
     "@clickhouse/client": "^1.0.0",
-    "node-cron": "^3.0.3"
+    "node-cron": "^4.6.0"
   },
   "author": "WeSense",
   "license": "AGPL-3.0-only"
