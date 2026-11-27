@@ -632,7 +632,6 @@ async function exportClassificationSnapshot() {
     // Query ClickHouse for latest non-empty name and position of each classified device.
     // argMaxIf picks the most recent value where the field is non-empty/non-zero,
     // so a recent reading with blank name doesn't overwrite an older one that had it.
-    const deviceList = classifiedIds.map(id => `'${id.replace(/'/g, "\\'")}'`).join(',');
     const metaQuery = `
         SELECT
             device_id,
@@ -640,14 +639,14 @@ async function exportClassificationSnapshot() {
             argMaxIf(latitude, timestamp, latitude != 0) as latitude,
             argMaxIf(longitude, timestamp, longitude != 0) as longitude
         FROM wesense.sensor_readings
-        WHERE device_id IN (${deviceList})
+        WHERE device_id IN {deviceIds:Array(String)}
           AND timestamp > now() - INTERVAL 90 DAY
         GROUP BY device_id
     `;
 
     let deviceMeta = {};
     try {
-        const result = await client.query({ query: metaQuery, format: 'JSONEachRow' });
+        const result = await client.query({ query: metaQuery, query_params: { deviceIds: classifiedIds }, format: 'JSONEachRow' });
         const rows = await result.json();
         for (const row of rows) {
             deviceMeta[row.device_id] = {
@@ -705,24 +704,29 @@ async function exportClassificationSnapshot() {
 }
 
 /**
- * Apply classifications to ClickHouse database
- * Only updates Meshtastic sensors
+ * Record classifications in wesense.device_classifications.
+ *
+ * Decisions are inserted (one row per device per decision; the latest wins)
+ * instead of rewriting sensor_readings. Rewriting rewrote large parts of the
+ * table per device, ran hundreds of times per cycle, and broke the readings'
+ * signatures. Readers get each device's effective type from the
+ * wesense.device_deployment_types view (migration 010).
+ *
+ * Only Meshtastic and Home Assistant devices are classified.
+ *
  * @param {Array} results - Classification results
- * @param {boolean} overwrite - If true, overwrite ALL rows; if false, only update blank rows
+ * @param {boolean} overwrite - true: the classification wins over the device's own
+ *   reported type; false: it applies only to devices that report none
  */
 async function applyClassifications(results, overwrite = false) {
     console.log('\n' + '='.repeat(80));
-    console.log('APPLYING CLASSIFICATIONS TO DATABASE');
-    if (overwrite) {
-        console.log('MODE: OVERWRITE (updating ALL rows)');
-    } else {
-        console.log('MODE: Normal (only updating blank deployment_type)');
-    }
+    console.log('RECORDING CLASSIFICATIONS');
+    console.log(overwrite
+        ? 'MODE: OVERRIDE (wins over the device\'s own reported type)'
+        : 'MODE: Normal (applies to devices that report no type)');
     console.log('='.repeat(80) + '\n');
 
-    // Filter to sensors with a device_id and classification
     // Skip sensors where weather API failed - we can't classify without weather data
-    // UNKNOWN sensors (with weather data) will have their deployment_type set to blank for future reclassification
     const weatherApiFailed = results.filter(r => r.weather_api_failed);
     if (weatherApiFailed.length > 0) {
         console.log(`Skipping ${weatherApiFailed.length} sensors where weather API failed:\n`);
@@ -735,113 +739,65 @@ async function applyClassifications(results, overwrite = false) {
         console.log('');
     }
 
-    const toApply = results.filter(r =>
+    const candidates = results.filter(r =>
         r.device_id &&
         r.inferred_deployment_type &&
-        !r.weather_api_failed  // Don't apply if weather API failed
+        !r.weather_api_failed
     );
-
-    const total = toApply.length;
-    console.log(`Found ${total} sensors with valid classifications to apply\n`);
-
-    let updated = 0;
-    let skipped = 0;
-    let errors = 0;
-
-    for (let i = 0; i < toApply.length; i++) {
-        const result = toApply[i];
-        const deviceId = result.device_id;
-        // UNKNOWN sensors get blank deployment_type so they're eligible for future reclassification
-        const deploymentType = result.inferred_deployment_type === 'UNKNOWN' ? '' : result.inferred_deployment_type;
-        const displayType = result.inferred_deployment_type; // For display purposes
-        const progress = `[${i + 1}/${total}]`;
-        const name = (result.node_name || deviceId).padEnd(30).slice(0, 30);
-
-        try {
-            // Check if this is a Meshtastic device (skip WeSense and others)
-            const sourceQuery = `
-                SELECT data_source, count() as total_rows FROM wesense.sensor_readings
-                WHERE device_id = {deviceId:String}
-                GROUP BY data_source
-            `;
-            const sourceResult = await client.query({
-                query: sourceQuery,
-                query_params: { deviceId },
-                format: 'JSONEachRow'
-            });
-            const sourceRows = await sourceResult.json();
-            const dataSource = (sourceRows[0]?.data_source || '').toUpperCase();
-            const totalRows = sourceRows[0]?.total_rows || 0;
-
-            if (!dataSource.startsWith('MESHTASTIC') && dataSource !== 'HOMEASSISTANT') {
-                console.log(`${progress} ${name} → skipped (${dataSource || 'unknown source'}, ${totalRows} rows)`);
-                skipped++;
-                continue;
-            }
-
-            // Count rows that will be updated
-            const countQuery = overwrite
-                ? `SELECT count() as cnt FROM wesense.sensor_readings WHERE device_id = {deviceId:String}`
-                : `SELECT count() as cnt FROM wesense.sensor_readings WHERE device_id = {deviceId:String} AND (deployment_type = '' OR deployment_type IS NULL)`;
-
-            const countResult = await client.query({
-                query: countQuery,
-                query_params: { deviceId },
-                format: 'JSONEachRow'
-            });
-            const countRows = await countResult.json();
-            const rowCount = countRows[0]?.cnt || 0;
-
-            if (rowCount === 0) {
-                console.log(`${progress} ${name} → ${displayType} (0 rows to update, ${totalRows} total)`);
-                skipped++;
-                continue;
-            }
-
-            // Update rows - either all (overwrite) or just blank ones
-            const query = overwrite
-                ? `ALTER TABLE wesense.sensor_readings UPDATE deployment_type = {deploymentType:String} WHERE device_id = {deviceId:String}`
-                : `ALTER TABLE wesense.sensor_readings UPDATE deployment_type = {deploymentType:String} WHERE device_id = {deviceId:String} AND (deployment_type = '' OR deployment_type IS NULL)`;
-
-            await client.command({
-                query,
-                query_params: { deviceId, deploymentType }
-            });
-
-            // For remote imports: also fill in node_name and position on rows where they're blank
-            if (result.is_remote) {
-                if (result.node_name) {
-                    await client.command({
-                        query: `ALTER TABLE wesense.sensor_readings UPDATE node_name = {nodeName:String} WHERE device_id = {deviceId:String} AND (node_name = '' OR node_name IS NULL)`,
-                        query_params: { deviceId, nodeName: result.node_name }
-                    });
-                }
-                if (result.latitude && result.longitude) {
-                    await client.command({
-                        query: `ALTER TABLE wesense.sensor_readings UPDATE latitude = {lat:Float64}, longitude = {lng:Float64} WHERE device_id = {deviceId:String} AND (latitude = 0 OR longitude = 0)`,
-                        query_params: { deviceId, lat: result.latitude, lng: result.longitude }
-                    });
-                }
-            }
-
-            const clearedNote = displayType === 'UNKNOWN' ? ' [cleared]' : '';
-            console.log(`${progress} ${name} → ${displayType}${clearedNote} (${rowCount}/${totalRows} rows updated)`);
-            updated++;
-
-        } catch (error) {
-            console.error(`${progress} ${name} ✗ ERROR: ${error.message}`);
-            errors++;
-        }
-
-        // Small delay to avoid overwhelming ClickHouse
-        await new Promise(resolve => setTimeout(resolve, 100));
+    if (candidates.length === 0) {
+        console.log('No classifications to record\n');
+        return { updated: 0, skipped: 0, errors: 0 };
     }
 
-    console.log('\n' + '-'.repeat(80));
-    console.log(`Applied: ${updated} | Skipped: ${skipped} | Errors: ${errors}`);
+    // One query for every candidate's data source (only Meshtastic/HA are classified)
+    const sourceResult = await client.query({
+        query: `
+            SELECT device_id, any(data_source) AS data_source
+            FROM wesense.sensor_readings
+            WHERE device_id IN {deviceIds:Array(String)}
+            GROUP BY device_id
+        `,
+        query_params: { deviceIds: candidates.map(r => r.device_id) },
+        format: 'JSONEachRow'
+    });
+    const sourceByDevice = new Map((await sourceResult.json()).map(r => [r.device_id, (r.data_source || '').toUpperCase()]));
+
+    const classifiedAt = new Date().toISOString().replace('T', ' ').replace('Z', '');
+    const rows = [];
+    let skipped = 0;
+    for (const result of candidates) {
+        const dataSource = sourceByDevice.get(result.device_id) || '';
+        if (!dataSource.startsWith('MESHTASTIC') && dataSource !== 'HOMEASSISTANT') {
+            skipped++;
+            continue;
+        }
+        rows.push({
+            device_id: result.device_id,
+            // UNKNOWN is recorded as '' so the device is eligible for reclassification
+            deployment_type: result.inferred_deployment_type === 'UNKNOWN' ? '' : result.inferred_deployment_type,
+            deployment_type_source: result.is_remote ? 'remote' : 'classifier',
+            overrides: overwrite ? 1 : 0,
+            node_name: result.is_remote ? (result.node_name || '') : '',
+            latitude: result.is_remote && result.latitude ? result.latitude : null,
+            longitude: result.is_remote && result.longitude ? result.longitude : null,
+            classified_at: classifiedAt
+        });
+    }
+
+    if (rows.length > 0) {
+        await client.insert({
+            table: 'wesense.device_classifications',
+            values: rows,
+            format: 'JSONEachRow'
+        });
+    }
+
+    const byType = rows.reduce((acc, r) => { acc[r.deployment_type || 'UNKNOWN'] = (acc[r.deployment_type || 'UNKNOWN'] || 0) + 1; return acc; }, {});
+    console.log('-'.repeat(80));
+    console.log(`Recorded: ${rows.length} ${JSON.stringify(byType)} | Skipped (not Meshtastic/HA): ${skipped}`);
     console.log('-'.repeat(80) + '\n');
 
-    return { updated, skipped, errors };
+    return { updated: rows.length, skipped, errors: 0 };
 }
 
 /**

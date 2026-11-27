@@ -41,13 +41,14 @@ export async function getSensors() {
             any(node_name) as node_name,
             any(latitude) as latitude,
             any(longitude) as longitude,
-            any(deployment_type) as current_deployment_type,
+            any(dt.deployment_type) as current_deployment_type,
             any(data_source) as sensor_data_source,
             count() as reading_count,
             countIf(reading_type = 'temperature') as temp_reading_count,
             min(timestamp) as first_seen,
             max(timestamp) as last_seen
         FROM wesense.sensor_readings
+        LEFT JOIN wesense.device_deployment_types AS dt USING (device_id)
         WHERE timestamp > now() - INTERVAL 90 DAY
           AND (upper(data_source) LIKE 'MESHTASTIC%' OR upper(data_source) = 'HOMEASSISTANT')
         GROUP BY device_id
